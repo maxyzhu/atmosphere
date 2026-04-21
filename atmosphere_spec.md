@@ -5,7 +5,7 @@ Version 0.1 · April 2026 · Maxime Zhu
 
 ## 0. Purpose of This Document
 
-This is a *working* technical spec. It defines the modules, interfaces, and key technical choices for the Atmosphere.ai research system. It is **not** a research proposal (see `concept_report_v0.2.docx` for that) and **not** a paper.
+This is a *working* technical spec. It defines the modules, interfaces, and key technical choices for the Atmosphere.ai research system. It is **not** a research proposal (see `concept_report_v0.2.md` for that) and **not** a paper.
 
 This document exists so that when Phase 0 begins, implementation questions have already been answered. It is expected to be revised throughout Phase 0 as reality disagrees with the plan.
 
