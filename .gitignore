@@ -1,0 +1,43 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Editor ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# --- Secrets (NEVER commit API tokens) ---
+.env
+.env.local
+*.key
+
+# --- Data (do not commit raw GIS / Mapillary dumps) ---
+data/
+!data/.gitkeep
+cache/
+*.tif
+*.tiff
+*.geotiff
+*.ply
+*.splat
+
+# --- Generated outputs ---
+outputs/
+!outputs/.gitkeep
+*.log
