@@ -1,5 +1,5 @@
 [project]
-name = "atmosphere.ai"
+name = "atmosphere"
 version = "0.1.0"
 description = "Research system for anchored world model generation via spatial retrieval"
 authors = [{ name = "Maxime Zhu" }]
