@@ -9,21 +9,24 @@ requires-python = ">=3.11"
 dependencies = [
     # Geo / spatial
     "pymap3d>=3.1.0",           # WGS84 <-> ENU coordinate conversions
-    "pyproj>=3.6.0",            # general-purpose projection utilities (used sparingly)
+    "pyproj>=3.6.0",            # general-purpose projection utilities
     "shapely>=2.0.0",           # 2D geometric operations on polygons
-    "geopandas>=0.14.0",        # geographic dataframes (OSM/LoD2 handling)
+    "geopandas>=0.14.0",        # geographic dataframes (used internally by retrieval)
     "osmnx>=2.0.0",             # OpenStreetMap data via Overpass API
-    "rasterio>=1.3.0",          # reading DEM GeoTIFF files
-    "requests>=2.31.0",         # Mapillary API HTTP client
+    "rasterio>=1.3.0",          # reading DEM GeoTIFF files (Day 3+)
+    "requests>=2.31.0",         # Mapillary API HTTP client (Day 4)
 
     # Numerics
     "numpy>=1.26.0",
     "scipy>=1.11.0",
 
+    # Visualization
+    "matplotlib>=3.8.0",        # 2D plotting
+
     # Utilities
-    "pydantic>=2.5.0",          # validated data classes (for SCP schema later)
+    "pydantic>=2.5.0",          # validated data classes (used later in SCP schema)
     "tqdm>=4.66.0",             # progress bars for batch fetches
-    "python-dotenv>=1.0.0",     # load Mapillary API token from .env
+    "python-dotenv>=1.0.0",     # load API tokens from .env
     "rich>=13.7.0",             # prettier CLI output
 ]
 
@@ -31,25 +34,24 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.1.0",
-    "ruff>=0.3.0",              # linter + formatter (replaces flake8/black)
+    "ruff>=0.3.0",              # linter + formatter
     "mypy>=1.8.0",              # static type checking
 ]
-
-# Phase 2+ dependencies (vision, generation) will be added in separate optional groups
-# when we need them, to keep the Phase 0 install light.
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["atmosphere"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-# Reasonable defaults. Loosen/tighten as the codebase grows.
 select = ["E", "F", "I", "W", "UP", "B", "SIM"]
-ignore = ["E501"]  # line length handled by formatter
+ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
