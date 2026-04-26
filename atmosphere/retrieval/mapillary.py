@@ -431,37 +431,32 @@ def fetch_mapillary_images(
         with open(raw_cache) as f:
             raw_items = json.load(f)
     else:
+        # Recursive adaptive splitting: starts at the full bbox and
+        # subdivides into quarters wherever Mapillary times out.
+        # This handles the dense-area timeout problem without paying
+        # for unnecessary subdivision in sparse areas.
         bbox = _radius_to_bbox(lat, lon, radius_m)
-        sub_bboxes = _split_bbox(bbox, n=3)
-        per_sub_limit = max(20, api_limit//len(sub_bboxes))
+        per_request_limit = 50  # Mapillary handles ~50/bbox reliably
         logger.info(
-            "Fetching Mapillary images: bbox=%s, split into %d sub-bboxes, "
-            "limit per sub-bbox=%d",
-            bbox, len(sub_bboxes), per_sub_limit,
+            "Fetching Mapillary (recursive split): bbox=%s, per-bbox limit=%d",
+            bbox, per_request_limit,
         )
+
+        raw_unsanitized = _fetch_recursive(bbox, limit=per_request_limit)
+
+        # Dedup by image ID — recursive splits can overlap on edges,
+        # and the same dashcam track can cross multiple sub-bboxes.
         raw_items = []
         seen_ids: set[str] = set()
-        for i, sub_bbox in enumerate(sub_bboxes):
-            try:
-                sub_items = _raw_fetch(sub_bbox, limit=per_sub_limit)
-            except Exception as e:
-                logger.warning(
-                    "Sub-bbox %d/%d failed (%s); skipping",
-                    i+1, len(sub_bboxes), e,
-                )
-                continue
-            new_count = 0
-            for item in sub_items:
-                item_id = str(item.get("id", ""))
-                if item_id and item_id not in seen_ids:
-                    seen_ids.add(item_id)
-                    raw_items.append(item)
-                    new_count += 1
-            logger.info(
-                "Sub-bbox %d/%d: %d returned, %d new (dedup)",
-                i+1, len(sub_bboxes), len(sub_items), new_count,
-            )
-            time.sleep(0.1)
+        for item in raw_unsanitized:
+            item_id = str(item.get("id", ""))
+            if item_id and item_id not in seen_ids:
+                seen_ids.add(item_id)
+                raw_items.append(item)
+        logger.info(
+            "After dedup: %d unique items (from %d raw)",
+            len(raw_items), len(raw_unsanitized),
+        )
 
         if len(raw_items) >= api_limit:
             logger.warning(
