@@ -13,9 +13,14 @@ Examples:
     python scripts/visualize_neighborhood.py \
         --lat 47.6097 --lon -122.3331 --stage osm
 
-    # Day 3 figure: buildings + Mapillary
+    # Day 3 figure: buildings + Mapillary, image count from area density
     python scripts/visualize_neighborhood.py \
         --lat 47.6097 --lon -122.3331 --stage mapillary
+
+    # Override the auto image count
+    python scripts/visualize_neighborhood.py \
+        --lat 47.6097 --lon -122.3331 --stage mapillary \
+        --mapillary-limit 200
 
     # Save to PNG for paper inclusion
     python scripts/visualize_neighborhood.py \
@@ -34,7 +39,6 @@ import matplotlib.pyplot as plt
 
 from atmosphere.stages import (
     STAGE_ORDER,
-    STAGE_REGISTRY,
     StageData,
     get_stages_up_to,
     list_stages,
@@ -64,7 +68,9 @@ def main() -> int:
     parser.add_argument("--lon", type=float,
                         help="Query center longitude (degrees)")
     parser.add_argument("--radius", type=float, default=150.0,
-                        help="Query radius in meters (default 150)")
+                        help="Half-side of the query square in meters "
+                             "(default 150). The actual fetch region is "
+                             "(radius + 20 m buffer) on each side.")
 
     parser.add_argument(
         "--stage", type=str, default=STAGE_ORDER[-1],
@@ -80,10 +86,14 @@ def main() -> int:
                              "If not set, display interactively.")
 
     # Stage-specific options
-    parser.add_argument("--mapillary-limit", type=int, default=100,
-                        help="Target image count after farthest-point sampling")
+    parser.add_argument(
+        "--mapillary-limit", type=int, default=None,
+        help="Target image count after farthest-point sampling. If "
+             "omitted, computed from area density (20 imgs / 100m × 100m).",
+    )
     parser.add_argument("--no-download", action="store_true",
-                        help="Skip thumbnail downloads (mapillary stage only)")
+                        help="Skip thumbnail downloads (skips all Graph "
+                             "API calls; pure vector-tile pipeline)")
     parser.add_argument("--no-cache", action="store_true",
                         help="Force re-fetch from all APIs")
 
@@ -92,12 +102,10 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # --- Handle --list-stages and exit ---
     if args.list_stages:
         _cmd_list_stages()
         return 0
 
-    # Lat/lon are required for all other invocations
     if args.lat is None or args.lon is None:
         parser.error("--lat and --lon are required unless --list-stages is given")
 
@@ -114,11 +122,14 @@ def main() -> int:
     )
 
     # --- Gather common options for all stages ---
-    stage_opts = {
+    # Only include mapillary_limit if user passed one. None lets
+    # fetch_mapillary_images compute target_count from area density.
+    stage_opts: dict = {
         "use_cache": not args.no_cache,
-        "mapillary_limit": args.mapillary_limit,
         "download_thumbnails": not args.no_download,
     }
+    if args.mapillary_limit is not None:
+        stage_opts["mapillary_limit"] = args.mapillary_limit
 
     # --- Run fetch for each stage in order ---
     data = StageData()

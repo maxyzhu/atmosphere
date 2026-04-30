@@ -161,7 +161,7 @@ class MapillaryStage(Stage):
             lat=lat,
             lon=lon,
             radius_m=radius_m,
-            target_count=opts.get("mapillary_limit", 100),
+            target_count=opts.get("mapillary_limit"),
             download_thumbnails=opts.get("download_thumbnails", True),
             use_cache=opts.get("use_cache", True),
         )
