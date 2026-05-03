@@ -17,6 +17,7 @@ from matplotlib.patches import FancyArrow, Polygon as MplPolygon
 
 from atmosphere.retrieval.buildings import Building, HeightSource
 from atmosphere.retrieval.mapillary import MapillaryImage
+from atmosphere.retrieval.streets import StreetSegment
 
 
 # Colors
@@ -27,6 +28,27 @@ _COLOR_BY_HEIGHT_SOURCE = {
 }
 _MAPILLARY_COLOR = "#2e9949"
 _MAPILLARY_COLOR_NO_COMPASS = "#8ab78f"
+_STREET_COLOR = "#6b6b6b"
+
+# Line width by OSM highway tier. The hierarchy here matches OSM's
+# rough functional classification — bigger roads draw thicker. Anything
+# not in the table falls back to the "default" entry.
+_STREET_LINEWIDTH = {
+    "motorway": 2.4,
+    "trunk": 2.2,
+    "primary": 2.0,
+    "secondary": 1.6,
+    "tertiary": 1.3,
+    "residential": 1.0,
+    "living_street": 0.9,
+    "unclassified": 0.9,
+    "service": 0.6,
+    "footway": 0.5,
+    "cycleway": 0.5,
+    "path": 0.5,
+    "pedestrian": 0.7,
+    "default": 0.8,
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,6 +69,25 @@ def plot_buildings(buildings: list[Building], ax: Axes) -> None:
             alpha=0.85,
         )
         ax.add_patch(patch)
+
+
+def plot_streets(streets: list[StreetSegment], ax: Axes) -> None:
+    """
+    Draw street segments as polylines, with line width keyed to the OSM
+    highway tag. Sits below Mapillary and above buildings in the layer
+    stack (see stages.py STAGE_ORDER).
+    """
+    for s in streets:
+        lw = _STREET_LINEWIDTH.get(s.highway_type, _STREET_LINEWIDTH["default"])
+        ax.plot(
+            s.polyline_enu[:, 0],
+            s.polyline_enu[:, 1],
+            color=_STREET_COLOR,
+            linewidth=lw,
+            alpha=0.75,
+            solid_capstyle="round",
+            zorder=2,  # above building fills, below Mapillary markers
+        )
 
 
 def plot_mapillary(
@@ -95,6 +136,7 @@ def apply_frame(
     radius_m: float | None = None,
     title: str | None = None,
     buildings: list[Building] | None = None,
+    streets: list[StreetSegment] | None = None,
     images: list[MapillaryImage] | None = None,
 ) -> None:
     """
@@ -118,6 +160,9 @@ def apply_frame(
     if buildings:
         all_points = np.concatenate([b.footprint_enu for b in buildings])
         extents.append(float(np.abs(all_points).max()))
+    if streets:
+        all_street_pts = np.concatenate([s.polyline_enu for s in streets])
+        extents.append(float(np.abs(all_street_pts).max()))
     if images:
         img_points = np.array([img.position_enu for img in images])
         extents.append(float(np.abs(img_points).max()))
@@ -149,6 +194,14 @@ def apply_frame(
                        edgecolor="black", linewidth=0.5,
                        label=f"height unknown ({n_none})"),
         ])
+    if streets:
+        total_len_km = sum(s.length_m for s in streets) / 1000.0
+        n_named = sum(1 for s in streets if s.name is not None)
+        handles.append(plt.Line2D(
+            [0], [0], color=_STREET_COLOR, linewidth=1.6,
+            label=f"streets ({len(streets)} segs, "
+                  f"{n_named} named, {total_len_km:.2f} km)",
+        ))
     if images:
         n_compass = sum(1 for i in images if i.has_compass)
         n_nocompass = len(images) - n_compass

@@ -2,9 +2,9 @@
 Stage-based visualization for reproducible figure generation.
 
 A "stage" represents one layer of the Atmosphere data pipeline: OSM
-buildings, Mapillary imagery, aligned cameras, rendered depth, generated
-scenes, and so on. Each stage is additive — drawing a later stage draws
-everything from earlier stages beneath it.
+buildings, street network, Mapillary imagery, aligned cameras, rendered
+depth, generated scenes, and so on. Each stage is additive — drawing a
+later stage draws everything from earlier stages beneath it.
 
 This exists primarily for paper reproducibility. When writing a paper
 section like "§3.1 Geometric priors from OSM", the accompanying figure
@@ -33,6 +33,7 @@ from matplotlib.axes import Axes
 
 from atmosphere.retrieval.buildings import Building, fetch_buildings
 from atmosphere.retrieval.mapillary import MapillaryImage, fetch_mapillary_images
+from atmosphere.retrieval.streets import StreetSegment, fetch_streets
 
 
 # -----------------------------------------------------------------------------
@@ -55,6 +56,9 @@ class StageData:
 
     # Geometry layer (stage: osm)
     buildings: list[Building] = field(default_factory=list)
+
+    # Street network layer (stage: street)
+    streets: list[StreetSegment] = field(default_factory=list)
 
     # Street-level imagery layer (stage: mapillary)
     mapillary_images: list[MapillaryImage] = field(default_factory=list)
@@ -142,11 +146,13 @@ class OSMStage(Stage):
         plot_buildings(data.buildings, ax)
 
 
-class MapillaryStage(Stage):
-    name = "mapillary"
+class StreetStage(Stage):
+    name = "street"
     description = (
-        "Street-level imagery positions and heading from Mapillary, overlaid "
-        "on the OSM layer. This is the 'visual references' layer."
+        "Street network from OpenStreetMap, drawn as polylines. Sits "
+        "between buildings and Mapillary in the visual stack — the "
+        "skeleton that organizes both. Defaults to the 'drive' network "
+        "type to match Mapillary's primarily-vehicular capture pattern."
     )
 
     def fetch(
@@ -157,6 +163,37 @@ class MapillaryStage(Stage):
         data: StageData,
         **opts: Any,
     ) -> None:
+        data.streets = fetch_streets(
+            lat=lat,
+            lon=lon,
+            radius_m=radius_m,
+            network_type=opts.get("street_network_type", "drive"),
+            use_cache=opts.get("use_cache", True),
+        )
+
+    def plot(self, data: StageData, ax: Axes) -> None:
+        from atmosphere.viz import plot_streets
+        plot_streets(data.streets, ax)
+
+
+class MapillaryStage(Stage):
+    name = "mapillary"
+    description = (
+        "Street-level imagery positions and heading from Mapillary, overlaid "
+        "on the OSM and street layers. This is the 'visual references' layer."
+    )
+
+    def fetch(
+        self,
+        lat: float,
+        lon: float,
+        radius_m: float,
+        data: StageData,
+        **opts: Any,
+    ) -> None:
+        # target_count=None lets fetch_mapillary_images auto-compute from
+        # area density (20 imgs / 100m × 100m). The CLI surfaces this as
+        # the default when --mapillary-limit is omitted.
         data.mapillary_images = fetch_mapillary_images(
             lat=lat,
             lon=lon,
@@ -178,6 +215,7 @@ class MapillaryStage(Stage):
 
 STAGE_REGISTRY: dict[str, Stage] = {
     "osm": OSMStage(),
+    "street": StreetStage(),
     "mapillary": MapillaryStage(),
     # Future: "aligned", "depth", "generated", "evaluation"
 }
@@ -185,7 +223,7 @@ STAGE_REGISTRY: dict[str, Stage] = {
 
 # Ordering matters for additive rendering. Future stages must be appended
 # here in the order they should layer (earlier stage = lower layer).
-STAGE_ORDER: list[str] = ["osm", "mapillary"]
+STAGE_ORDER: list[str] = ["osm", "street", "mapillary"]
 
 
 def get_stages_up_to(target: str) -> list[Stage]:

@@ -13,7 +13,11 @@ Examples:
     python scripts/visualize_neighborhood.py \
         --lat 47.6097 --lon -122.3331 --stage osm
 
-    # Day 3 figure: buildings + Mapillary, image count from area density
+    # Day 4 figure: buildings + streets
+    python scripts/visualize_neighborhood.py \
+        --lat 47.6097 --lon -122.3331 --stage street
+
+    # Day 3+ figure: buildings + streets + Mapillary, count from area density
     python scripts/visualize_neighborhood.py \
         --lat 47.6097 --lon -122.3331 --stage mapillary
 
@@ -91,6 +95,11 @@ def main() -> int:
         help="Target image count after farthest-point sampling. If "
              "omitted, computed from area density (20 imgs / 100m × 100m).",
     )
+    parser.add_argument(
+        "--street-network-type", type=str, default="all",
+        choices=["drive", "drive_service", "walk", "bike", "all", "all_private"],
+        help="osmnx network filter for the street stage (default: drive).",
+    )
     parser.add_argument("--no-download", action="store_true",
                         help="Skip thumbnail downloads (skips all Graph "
                              "API calls; pure vector-tile pipeline)")
@@ -127,6 +136,7 @@ def main() -> int:
     stage_opts: dict = {
         "use_cache": not args.no_cache,
         "download_thumbnails": not args.no_download,
+        "street_network_type": args.street_network_type,
     }
     if args.mapillary_limit is not None:
         stage_opts["mapillary_limit"] = args.mapillary_limit
@@ -152,6 +162,7 @@ def main() -> int:
         radius_m=args.radius,
         title=title,
         buildings=data.buildings,
+        streets=data.streets,
         images=data.mapillary_images,
     )
 
