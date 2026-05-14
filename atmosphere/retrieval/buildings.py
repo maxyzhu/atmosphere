@@ -72,6 +72,10 @@ class Building:
         height_source: Where the height value came from.
         osm_id: OpenStreetMap element ID, for traceability.
         building_type: OSM tag value (e.g., "residential", "commercial").
+        ground_elevation_m: Terrain elevation at this building's base,
+            in meters above the local ENU z=0 plane. None in Phase 0
+            (DEM is Phase 1); reserved so adding terrain in Phase 1
+            doesn't require an architectural rewrite.
     """
 
     footprint_enu: np.ndarray
@@ -79,6 +83,7 @@ class Building:
     height_source: HeightSource
     osm_id: int
     building_type: str
+    ground_elevation_m: float | None = None
 
     @property
     def has_height(self) -> bool:

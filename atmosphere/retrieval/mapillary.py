@@ -63,17 +63,29 @@ class MapillaryImage:
         position_enu: (east, north) in meters, in the caller's local frame.
         compass_angle_deg: Camera heading, degrees clockwise from north
                            (0 = N, 90 = E). None if missing.
+        is_pano: True if this is a 360° equirectangular panorama,
+                 False if a regular perspective image. Read from the
+                 vector tile's `is_pano` property. Downstream world
+                 model conditioning (WorldMirror i2s mode) prefers
+                 panos, so this is the priority signal for selection.
         thumb_url: Mapillary CDN URL (signed, may expire). Empty string
                    when thumbnail fetching was skipped.
         thumb_path: Local filesystem path to the cached thumbnail, or None
                     if download was skipped or failed.
+        ground_elevation_m: Terrain elevation at this image's position,
+                            in meters above the local ENU z=0 plane.
+                            None in Phase 0 (DEM is Phase 1); reserved
+                            so adding terrain in Phase 1 doesn't require
+                            an architectural rewrite.
     """
 
     mapillary_id: str
     position_enu: tuple[float, float]
     compass_angle_deg: float | None
+    is_pano: bool
     thumb_url: str
     thumb_path: Path | None
+    ground_elevation_m: float | None = None
 
     @property
     def has_compass(self) -> bool:
@@ -242,6 +254,7 @@ def _decode_image_features(
             "lon": lon,
             "lat": lat,
             "compass_angle": props.get("compass_angle"),
+            "is_pano": bool(props.get("is_pano", False)),
         })
 
     return features
@@ -322,7 +335,10 @@ def _farthest_point_sample(
 # -----------------------------------------------------------------------------
 
 
-_FIELDS_THUMB = "thumb_256_url"
+# WorldGen / WorldMirror conditioning needs >256 px input; 2048 px is
+# Mapillary's largest publicly served thumbnail. The Graph API field name
+# must match the response key, so both are kept consistent below.
+_FIELDS_THUMB = "thumb_2048_url"
 
 
 def _fetch_thumb_url(image_id: str, timeout_s: float = 15.0) -> str | None:
@@ -333,7 +349,7 @@ def _fetch_thumb_url(image_id: str, timeout_s: float = 15.0) -> str | None:
     try:
         r = requests.get(url, params=params, headers=headers, timeout=timeout_s)
         r.raise_for_status()
-        return r.json().get("thumb_256_url")
+        return r.json().get(_FIELDS_THUMB)
     except Exception as exc:
         logger.warning("Failed to fetch thumb URL for %s: %s", image_id, exc)
         return None
@@ -461,6 +477,7 @@ def fetch_mapillary_images(
             mapillary_id=mid,
             position_enu=(float(e), float(n)),
             compass_angle_deg=compass,
+            is_pano=bool(feat.get("is_pano", False)),
             thumb_url="",
             thumb_path=None,
         ))
@@ -495,8 +512,10 @@ def fetch_mapillary_images(
             mapillary_id=img.mapillary_id,
             position_enu=img.position_enu,
             compass_angle_deg=img.compass_angle_deg,
+            is_pano=img.is_pano,
             thumb_url=thumb_url,
             thumb_path=thumb_path,
+            ground_elevation_m=img.ground_elevation_m,
         ))
         time.sleep(0.05)  # politeness between Graph API hits
 

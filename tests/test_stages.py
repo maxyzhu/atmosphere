@@ -15,10 +15,11 @@ import pytest
 from atmosphere.stages import (
     STAGE_ORDER,
     STAGE_REGISTRY,
-    OSMStage,
     MapillaryStage,
+    OSMStage,
     Stage,
     StageData,
+    StreetStage,
     get_stages_up_to,
     list_stages,
 )
@@ -41,6 +42,16 @@ class TestRegistry:
         """OSM must be the foundational layer — no stage depends on it
         not being first. Breaking this would break every later stage."""
         assert STAGE_ORDER[0] == "osm"
+
+    def test_street_between_osm_and_mapillary(self):
+        """Streets sit between buildings (filled polygons) and Mapillary
+        (point markers) in the visual stack. Reordering this would
+        either hide street geometry under buildings or under markers,
+        breaking every figure that layers all three."""
+        idx_osm = STAGE_ORDER.index("osm")
+        idx_street = STAGE_ORDER.index("street")
+        idx_mapillary = STAGE_ORDER.index("mapillary")
+        assert idx_osm < idx_street < idx_mapillary
 
 
 class TestGetStagesUpTo:
@@ -84,6 +95,7 @@ class TestStageData:
     def test_empty_default(self):
         data = StageData()
         assert data.buildings == []
+        assert data.streets == []
         assert data.mapillary_images == []
 
     def test_mutable_fields_independent_between_instances(self):
@@ -91,7 +103,9 @@ class TestStageData:
         d1 = StageData()
         d2 = StageData()
         d1.buildings.append("x")  # type: ignore[arg-type]
+        d1.streets.append("y")    # type: ignore[arg-type]
         assert d2.buildings == []
+        assert d2.streets == []
 
 
 class TestOSMStageIntegration:
@@ -148,6 +162,7 @@ class TestMapillaryStageIntegration:
         """Running MapillaryStage must not clobber fields populated earlier."""
         data = StageData()
         data.buildings = ["existing_building"]  # type: ignore[list-item]
+        data.streets = ["existing_street"]      # type: ignore[list-item]
 
         with patch(
             "atmosphere.stages.fetch_mapillary_images",
@@ -161,5 +176,66 @@ class TestMapillaryStageIntegration:
                 use_cache=True,
             )
 
-        # Buildings must still be there
+        assert data.buildings == ["existing_building"]
+        assert data.streets == ["existing_street"]
+
+
+class TestStreetStageIntegration:
+    """StreetStage.fetch delegates to fetch_streets; verify the contract."""
+
+    def test_populates_streets(self):
+        with patch(
+            "atmosphere.stages.fetch_streets",
+            return_value=["seg1", "seg2", "seg3"],
+        ) as mocked:
+            data = StageData()
+            StreetStage().fetch(
+                lat=47.6097, lon=-122.3331, radius_m=100,
+                data=data, use_cache=False,
+            )
+            mocked.assert_called_once()
+            assert data.streets == ["seg1", "seg2", "seg3"]
+
+    def test_passes_network_type_option(self):
+        """`street_network_type` opt should reach fetch_streets unchanged."""
+        with patch(
+            "atmosphere.stages.fetch_streets",
+            return_value=[],
+        ) as mocked:
+            StreetStage().fetch(
+                lat=47.6097, lon=-122.3331, radius_m=100,
+                data=StageData(),
+                street_network_type="all",
+                use_cache=False,
+            )
+            assert mocked.call_args.kwargs["network_type"] == "all"
+
+    def test_default_network_type_is_drive(self):
+        """With no override, fetch_streets must receive network_type='drive',
+        keeping behavior consistent with the StreetStage docstring."""
+        with patch(
+            "atmosphere.stages.fetch_streets",
+            return_value=[],
+        ) as mocked:
+            StreetStage().fetch(
+                lat=47.6097, lon=-122.3331, radius_m=100,
+                data=StageData(),
+                use_cache=False,
+            )
+            assert mocked.call_args.kwargs["network_type"] == "drive"
+
+    def test_preserves_earlier_stage_data(self):
+        """StreetStage must not clobber buildings populated by OSMStage."""
+        data = StageData()
+        data.buildings = ["existing_building"]  # type: ignore[list-item]
+
+        with patch(
+            "atmosphere.stages.fetch_streets",
+            return_value=[],
+        ):
+            StreetStage().fetch(
+                lat=47.6097, lon=-122.3331, radius_m=100,
+                data=data, use_cache=False,
+            )
+
         assert data.buildings == ["existing_building"]

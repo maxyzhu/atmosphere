@@ -109,3 +109,173 @@ Optional:
 --verbose/-v (False)
 --list-stage
 --help/-h
+
+## 2026-05-11 Day 4 (planning) · Research framing pivot: generation → reconstruction
+
+Today's central insight, recorded before any Day 4 code: **Atmosphere's
+research contribution is reconstruction with GIS priors, not generation
+from GIS conditioning.** The distinction matters and reshapes Phase 0.
+
+### What changed
+
+The spec (atmosphere_spec.md v0.1) framed M5 as "WorldGen wrapper that
+consumes SCPBundle" — implicitly assuming a generation backbone that
+takes geometric conditioning and synthesizes a scene. Two questions
+broke that frame:
+
+1. **Does WorldGen actually exist?** No specific open-source project
+   matched the name. "WorldGen" was a placeholder for "some
+   FLUX-based 3DGS generator" inherited from earlier conversations.
+2. **Do any open world models accept multi-image input?** Yes: HY-World 2.0
+   (Tencent, 2026-04-15) does, but only its **WorldMirror 2.0** component
+   is open-sourced — the multi-view *reconstruction* module, not the
+   generation modules (HY-Pano 2.0, WorldStereo 2.0, WorldNav are
+   referenced in the paper, weights not yet released).
+
+Lyra 2.0 (NVIDIA, 2025-09) was the obvious alternative — Apache 2.0,
+3DGS output, well-documented. But Lyra is a **generation** model: it
+takes a single image + a synthetic camera trajectory, hallucinates a
+fly-through video, and reconstructs 3DGS from its own hallucinations.
+Multi-image input isn't supported; the multi-view inside Lyra is
+generated, not observed.
+
+This forced the question: which paradigm fits Atmosphere?
+
+### Reconstruction vs generation
+
+| Paradigm | Input | Strength | Atmosphere fit |
+|---|---|---|---|
+| Generation (Lyra, HY-Pano) | Single image / text | Imagination from sparse priors | Poor — we have rich observations, not a single hint |
+| Reconstruction (WorldMirror) | Multi-view real images + optional camera/depth priors | Fidelity to observed geometry | Strong — Mapillary *is* the multi-view; OSM *is* the prior |
+
+**Mapillary gives us a real observation path with structured gaps.**
+The images are sparse (street-bound), but the gaps are predictable
+(building backs, courtyards, roofs), and the gaps are exactly where
+OSM LoD1 footprints + heights constrain the geometry. Reconstruction
+with GIS priors is the natural fit; pure generation throws away the
+observations we paid to retrieve.
+
+### WorldMirror 2.0's prior interface
+
+WorldMirror's Python API turns out to be designed for exactly our case:
+
+```
+pipeline(
+    input_path='images/',          # directory of Mapillary thumbnails
+    prior_cam_path='camera.json',  # our M3 output
+    prior_depth_path='depth/',     # our M2 output
+)
+```
+
+The `prior_cam_path` JSON schema accepts a list of 4×4 extrinsics and
+3×3 intrinsics matrices; missing priors are passed as empty lists and
+the model falls back to internal estimation. This is exactly the A/B
+slot Atmosphere needs: same Mapillary images, toggle priors on/off,
+measure reconstruction quality difference. The SFB benchmark gets a
+natural design from this: three conditions (no prior / pose only /
+pose+depth) on a fixed coordinate set, measure delta on building-back
+region fidelity.
+
+VRAM: ~12–24 GB for WorldMirror 2.0 inference (BF16 + FSDP offload
+options for tighter budgets). RTX 4090 sufficient — don't need A100.
+
+### What this means for M1–M6 in the spec
+
+- **M1 (Retrieval)**: unchanged. Already complete.
+- **M2 (Canonicalization)**: refocused. M2's depth render now feeds
+  `prior_depth_path` directly, not a hand-rolled WorldGen conditioning
+  bundle. trimesh + pyrender suffices for Phase 0 (nvdiffrast deferred;
+  Mac has no NVIDIA path anyway). Output: float32 .npy per camera view,
+  one per Mapillary image.
+- **M3 (Cross-Modal Alignment)**: refocused. M3 outputs the 4×4
+  extrinsics that go into `prior_cam_path`. Phase 0 "baseline M3" can
+  just compute c2w from Mapillary GPS + compass_angle directly (no
+  optimization); Phase 1 M3 uses LoD1 silhouette matching to refine
+  poses from 5–10m to sub-meter.
+- **M4 (SCP Bundle)**: simplified to a thin schema mapping our internal
+  types to WorldMirror's expected JSON / file layout. Not a novel data
+  structure — just an adapter.
+- **M5 (Generation → Reconstruction)**: a wrapper around
+  `WorldMirrorPipeline`, not a custom diffusion harness. The complexity
+  budget for M5 collapses by an order of magnitude.
+- **M6 (Evaluation)**: now has a clean three-condition design built
+  into the backbone's API, not bolted on.
+
+### Risk surfaced today
+
+WorldMirror is *only* reconstruction — it won't fill structurally
+unobserved regions (building backs that no Mapillary camera ever
+faced). The output will have holes. Phase 0 accepts this as a known
+limitation; Phase 2 — once WorldStereo 2.0 or an equivalent
+open-source generator with multi-view conditioning is available — can
+hybridize "reconstruct where observed, generate where occluded." This
+is genuinely a research gap with no current open-source solution.
+
+### Reframe for narrative / NIW
+
+Not "AEC tool that generates worlds from GIS." Instead: **"Spatial RAG
+for 3D world reconstruction: given sparse, noisy real-world
+observations (street imagery) and an authoritative geometric prior
+(GIS), how should they be combined to maximize the fidelity of a
+reconstructed 3D scene?"** The retrieval/augmentation/generation
+three-layer framing survives; the "generation" backend is just one
+model type and currently the reconstruction variant is the one that
+works.
+
+## 2026-05-11 Day 4 (impl, part 1) · Code cleanup before M2
+
+Three concrete code changes today, all aimed at unblocking M2 and the
+WorldMirror integration that follows.
+
+### Phase A patches
+
+1. **`is_pano` restored to `MapillaryImage`.** Removed during Day 3.2 as
+   unused; reinstated because WorldMirror's i2s-style modes prefer
+   panorama input over perspective. The field is free from the vector
+   tile properties, so cost is zero. The original deletion was
+   shortsighted — "unused right now" is not the same as "will stay
+   unused."
+2. **`_FIELDS_THUMB` bumped from `thumb_256_url` to `thumb_2048_url`.**
+   256 px is too low for meaningful visual conditioning into a world
+   model. Mapillary serves up to 2048 px publicly. Verify on first
+   download that the larger URLs actually work — some older images may
+   only have 256/1024.
+3. **`ground_elevation_m: float | None = None`** added as optional field
+   on both `Building` and `MapillaryImage`. Phase 0 sets it to None
+   (flat-earth z=0 assumption acceptable for PoC). The field exists now
+   so that when Phase 1's DEM integration arrives, dataclass shape
+   doesn't change and the codebase doesn't fork. Pure architectural
+   hygiene.
+
+### Test suite repair
+
+`test_mapillary.py` was three commits stale: it imported `_radius_to_bbox`
+(replaced by `_square_bbox_with_buffer`), constructed `MapillaryImage`
+with a `captured_at` field that no longer exists, and called
+`_farthest_point_sample(..., seed=...)` with a parameter that was removed
+when FPS became deterministically center-seeded. Rewrote against the
+current vector-tile pipeline: 17 tests covering bbox math, density
+formula, FPS edge cases (center seeding, missing compass, full
+determinism), and end-to-end retrieval with `_fetch_tile_bytes` /
+`_decode_image_features` patched.
+
+`test_stages.py` lacked any coverage of `StreetStage`. Added 4 tests
+(population, network_type option pass-through, default network_type="drive",
+earlier-stage preservation) plus a `STAGE_ORDER` invariant test ensuring
+streets sit between buildings and Mapillary in the layer stack.
+
+Day 3 leftover: `test_buildings.py` patched `ox.features_from_point`,
+but Day 3.2 had migrated `buildings.py` to `ox.features_from_bbox`. The
+mocks silently no-op'd and tests hit the real Overpass API, returning
+18 real Pioneer Square buildings instead of the 2 fake ones the
+assertions expected. Repointed the patch target; tests pass.
+
+Final state: 84 / 84 passing in 0.39 s.
+
+### Lesson
+
+Three-tests-failing-on-a-clean-clone is a smell, not a passing grade.
+The failures were all stale-mock issues, not logic bugs, but they were
+hiding because nobody re-ran the suite after Day 3's refactor. **Phase
+0 going forward: every retrieval-layer refactor must end with
+`uv run pytest -v` green, not "green for the new module."**

@@ -3,7 +3,7 @@ Tests for the building retrieval module.
 
 Strategy: we do NOT hit the real Overpass API in unit tests — it would
 be slow, flaky, and subject to rate limits. Instead, we mock
-`osmnx.features_from_point` to return a crafted GeoDataFrame, and verify
+`osmnx.features_from_bbox` to return a crafted GeoDataFrame, and verify
 that our conversion + filtering + provenance logic handles it correctly.
 
 A separate integration test (not in this file) would exercise the real
@@ -179,7 +179,7 @@ class TestFetchBuildings:
         """With mocked OSM, fetch_buildings returns correctly parsed Buildings."""
         fake = _fake_gdf_near(DLR_LAT, DLR_LON)
         with patch(
-            "atmosphere.retrieval.buildings.ox.features_from_point",
+            "atmosphere.retrieval.buildings.ox.features_from_bbox",
             return_value=fake,
         ):
             bs = fetch_buildings(
@@ -202,7 +202,7 @@ class TestFetchBuildings:
     def test_height_provenance_tracked(self, tmp_path):
         fake = _fake_gdf_near(DLR_LAT, DLR_LON)
         with patch(
-            "atmosphere.retrieval.buildings.ox.features_from_point",
+            "atmosphere.retrieval.buildings.ox.features_from_bbox",
             return_value=fake,
         ):
             bs = fetch_buildings(
@@ -226,7 +226,7 @@ class TestFetchBuildings:
 
         # First call — API is hit
         with patch(
-            "atmosphere.retrieval.buildings.ox.features_from_point",
+            "atmosphere.retrieval.buildings.ox.features_from_bbox",
             return_value=fake,
         ) as mocked:
             fetch_buildings(
@@ -241,7 +241,7 @@ class TestFetchBuildings:
 
         # Second call — API must NOT be hit
         with patch(
-            "atmosphere.retrieval.buildings.ox.features_from_point",
+            "atmosphere.retrieval.buildings.ox.features_from_bbox",
             return_value=fake,
         ) as mocked2:
             fetch_buildings(
@@ -257,7 +257,7 @@ class TestFetchBuildings:
             crs="EPSG:4326",
         )
         with patch(
-            "atmosphere.retrieval.buildings.ox.features_from_point",
+            "atmosphere.retrieval.buildings.ox.features_from_bbox",
             return_value=empty,
         ):
             bs = fetch_buildings(
