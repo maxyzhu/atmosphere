@@ -279,3 +279,32 @@ The failures were all stale-mock issues, not logic bugs, but they were
 hiding because nobody re-ran the suite after Day 3's refactor. **Phase
 0 going forward: every retrieval-layer refactor must end with
 `uv run pytest -v` green, not "green for the new module."**
+
+## 2026-05-14 Day 4 (planning, part 2) · WorldMirror priors are real; Mapillary's API gives us more than we thought
+
+Two source verifications done before writing M2:
+
+**1. WorldMirror's `prior_cam_path` and `prior_depth_path` are actually consumed.**
+Read pipeline.py + inference_utils.py. Both loaders return real tensors
+(`[1, N, H, W]` depth, `[1, N, 4, 4]` extrinsics). Format details that
+matter: `.npy` float32 in meters; sky as `np.inf` (loader coerces to 0
+via `nan_to_num`); filename match by image stem; all-or-nothing — any
+missing prior drops the whole batch.
+
+**2. Mapillary Graph API returns more than GPS + compass.** Probed two
+real images. Each carries `camera_parameters` ([focal_ratio, k1, k2]),
+`camera_type`, `computed_geometry`, `computed_compass_angle`,
+`computed_rotation` (axis-angle, full 3-DoF pose), and `atomic_scale`.
+Per-image focal varies ~2× between the two probed samples, so M2 must
+render with per-image K, not a hardcoded FOV. Caveats: raw
+`compass_angle` is unreliable EXIF fallback (always use computed);
+`computed_altitude` is SfM-internal, not real elevation (Phase 0 fixes
+z = 1.5 m); `computed_rotation` lives in SfM frame not ENU, requiring
+calibration on Day 5.
+
+**Framing consequence:** Atmosphere is not "a better SfM" — Mapillary
+already shipped a production SfM. The contribution is anchoring world
+model output to absolute, independently-sourced LoD geometry, which SfM
+alone cannot do (locally consistent, globally arbitrary). M3 reduces to
+a thin adapter (read API → rotvec → JSON, ≤ 100 LOC). SFB's A/B becomes:
+Mapillary-only baseline vs Mapillary + OSM LoD anchor.

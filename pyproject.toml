@@ -27,6 +27,10 @@ dependencies = [
     "rich>=13.7.0",             # prettier CLI output
     "mercantile>=1.2.1",
     "mapbox-vector-tile>=2.2.0",
+    "open3d>=0.19.0",
+    "trimesh>=4.0.0",          # mesh construction (footprint extrusion in M2)
+    "mapbox-earcut>=2.0.0",
+    "manifold3d>=3.4.1",
 ]
 
 [project.optional-dependencies]
