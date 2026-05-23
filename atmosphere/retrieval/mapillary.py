@@ -183,6 +183,28 @@ TILE_EXTENT: int = 4096
 FPS_SPATIAL_WEIGHT: float = 1.0
 FPS_COMPASS_WEIGHT: float = 0.44
 
+# Aspect ratio filter constants. WorldMirror requires all input images
+# to share a single aspect ratio (its prepare_images_to_tensor errors
+# out otherwise); see scripts/debug_low_hit_renders.py / Day 5 RunPod
+# first attempt for the empirical evidence.
+#
+# We target 16:9 (=1.78), the dominant aspect in modern Mapillary
+# perspective captures (dashcam/phone landscape). A small tolerance
+# absorbs minor encoder rounding (e.g. 2048×1152 = 1.778 vs 1920×1080
+# = 1.778 exactly).
+#
+# Because aspect comes from Graph API metadata (not vector tiles), we
+# can't filter the candidate pool before FPS. Instead we oversample at
+# FPS, fetch metadata for the sample, then aspect-filter and truncate.
+# OVERSAMPLE_FACTOR is empirical: at DLR ~42% of sampled images are
+# 16:9, so a factor of 2.5 gives ~25 surviving images, slightly above
+# our usual target_count of 24. If the first pass yields fewer than
+# target_count, fetch_mapillary_images escalates the factor.
+TARGET_ASPECT_RATIO: float = 16.0 / 9.0          # = 1.7778...
+ASPECT_TOLERANCE: float = 0.02                   # ±1% slack
+ASPECT_OVERSAMPLE_FACTOR: float = 2.5            # FPS this many × target
+ASPECT_OVERSAMPLE_FACTOR_ESCALATED: float = 4.5  # retry factor if short
+
 
 # -----------------------------------------------------------------------------
 # Bbox math
@@ -322,6 +344,26 @@ def _decode_image_features(
         })
 
     return features
+
+
+def _matches_aspect(
+    width: int | None,
+    height: int | None,
+    target_aspect: float,
+    tolerance: float,
+) -> bool:
+    """
+    True if (width, height) is within `tolerance` of `target_aspect`.
+
+    Returns False when width or height is None (treated as
+    "aspect-unknown, drop"). This matches the M3/M4 fail-fast policy:
+    images without metadata can't participate in the WorldMirror
+    prior anyway, so silently dropping them at aspect-filter time is
+    no worse than the M3 drop they would receive downstream.
+    """
+    if width is None or height is None or height <= 0:
+        return False
+    return abs(width / height - target_aspect) <= tolerance
 
 
 # -----------------------------------------------------------------------------
@@ -557,6 +599,8 @@ def fetch_mapillary_images(
     fetch_camera_metadata: bool = False,
     fetch_camera_z: bool = False,
     cam_height_above_ground_m: float = 1.5,
+    target_aspect_ratio: float | None = None,
+    aspect_tolerance: float = ASPECT_TOLERANCE,
     cache_dir: Path | str = "data/mapillary_cache",
     use_cache: bool = True,
 ) -> list[MapillaryImage]:
@@ -596,6 +640,18 @@ def fetch_mapillary_images(
             applied uniformly to all sampled images. Phase 1+ may
             condition this on camera_type or estimate per-image via
             Perspective Fields (changelog Day 5 Part 1 §3).
+        target_aspect_ratio: If set, only images whose width / height is
+            within ``aspect_tolerance`` of this value are returned.
+            WorldMirror requires uniform aspect across the input batch.
+            Standard choice is 16:9 (= TARGET_ASPECT_RATIO = 1.778). When
+            set, fetch_camera_metadata is implied True (aspect comes from
+            metadata) and FPS oversamples by ASPECT_OVERSAMPLE_FACTOR so
+            the post-filter set still meets target_count. If the first
+            pass underfills, the function escalates to a larger FPS pool
+            once; further shortfall produces a warning and returns what
+            it has.
+        aspect_tolerance: Allowed deviation from target_aspect_ratio,
+            absolute units (e.g. 0.02 = ±~1%). Default ASPECT_TOLERANCE.
         cache_dir: Root directory for tile cache and (if downloading)
             thumbnail cache.
         use_cache: If False, ignore the on-disk tile cache.
@@ -606,6 +662,16 @@ def fetch_mapillary_images(
     """
     if frame is None:
         frame = LocalFrame(lat0=lat, lon0=lon)
+
+    # When aspect filtering is requested, we must have width/height,
+    # which comes from the Graph API metadata. Force the flag on so
+    # callers can't accidentally request aspect filtering without
+    # paying for the metadata fetch.
+    if target_aspect_ratio is not None and not fetch_camera_metadata:
+        logger.info(
+            "target_aspect_ratio set; forcing fetch_camera_metadata=True"
+        )
+        fetch_camera_metadata = True
 
     cache_dir = Path(cache_dir)
     tile_cache_dir = cache_dir / "tiles"
@@ -675,10 +741,27 @@ def fetch_mapillary_images(
         return []
 
     # --- 4. Farthest-point sampling, seeded from bbox center ---
-    sampled = _farthest_point_sample(parsed, target_count=target_count)
+    # When aspect filtering is requested, oversample so that the
+    # post-filter set is still >= target_count. The oversampling
+    # multiplier is ASPECT_OVERSAMPLE_FACTOR (~2.5x at DLR); we
+    # escalate to ASPECT_OVERSAMPLE_FACTOR_ESCALATED (~4.5x) if the
+    # first pass underfills.
+    fps_count = target_count
+    if target_aspect_ratio is not None:
+        fps_count = min(
+            len(parsed),
+            max(target_count,
+                int(math.ceil(target_count * ASPECT_OVERSAMPLE_FACTOR))),
+        )
+        logger.info(
+            "Aspect filter on; FPS oversampling to %d (target %d, factor %.1f×)",
+            fps_count, target_count, ASPECT_OVERSAMPLE_FACTOR,
+        )
+
+    sampled = _farthest_point_sample(parsed, target_count=fps_count)
     logger.info(
         "FPS: selected %d (target %d, pool %d)",
-        len(sampled), target_count, len(parsed),
+        len(sampled), fps_count, len(parsed),
     )
 
     if (
@@ -766,5 +849,140 @@ def fetch_mapillary_images(
             "Camera metadata: %d / %d images have all four required fields",
             with_meta, len(final),
         )
+
+    # --- 6. Aspect filter + truncate (Day 5 RunPod-attempt 2 patch) ---
+    # WorldMirror's prepare_images_to_tensor errors out on mixed aspect
+    # ratios. We filter to images matching `target_aspect_ratio` within
+    # `aspect_tolerance`, then truncate to `target_count`. If under-
+    # filled, escalate FPS once and re-do the per-image fetch for the
+    # newly-sampled images (the metadata + thumb caches mean previously
+    # fetched images are free on the retry).
+    if target_aspect_ratio is not None:
+        kept = [
+            img for img in final
+            if _matches_aspect(
+                img.width, img.height,
+                target_aspect_ratio, aspect_tolerance,
+            )
+        ]
+        logger.info(
+            "Aspect filter @ %.3f ± %.3f: kept %d / %d",
+            target_aspect_ratio, aspect_tolerance, len(kept), len(final),
+        )
+
+        if len(kept) < target_count:
+            # Escalate: redo FPS at a higher factor over the same parsed
+            # pool, then per-image fetch only for newly-sampled images.
+            escalated_count = min(
+                len(parsed),
+                int(math.ceil(target_count * ASPECT_OVERSAMPLE_FACTOR_ESCALATED)),
+            )
+            if escalated_count > fps_count:
+                logger.info(
+                    "Aspect filter underfilled (%d/%d); escalating FPS "
+                    "to %d (factor %.1f×)",
+                    len(kept), target_count, escalated_count,
+                    ASPECT_OVERSAMPLE_FACTOR_ESCALATED,
+                )
+                # Bigger FPS over the same pool. _farthest_point_sample
+                # is deterministic (seed = bbox center), so the first
+                # fps_count items of the escalated selection equal the
+                # original sampled list; we only need to fetch the new
+                # tail.
+                escalated_sample = _farthest_point_sample(
+                    parsed, target_count=escalated_count,
+                )
+                already = {f.mapillary_id for f in final}
+                new_imgs = [
+                    img for img in escalated_sample
+                    if img.mapillary_id not in already
+                ]
+                logger.info(
+                    "Escalate: fetching metadata for %d additional images",
+                    len(new_imgs),
+                )
+
+                # DEM for new images
+                if fetch_camera_z and new_imgs:
+                    from atmosphere.retrieval.dem import sample_elevations_batch
+                    new_latlon = []
+                    for img in new_imgs:
+                        e, n = img.position_enu
+                        img_lat, img_lon, _ = frame.enu_to_wgs84(e, n, 0.0)
+                        new_latlon.append((float(img_lat), float(img_lon)))
+                    dem_results = sample_elevations_batch(new_latlon)
+                    for img, (elev_m, _src) in zip(
+                        new_imgs, dem_results, strict=True,
+                    ):
+                        if elev_m is None:
+                            cam_z_by_id[img.mapillary_id] = None
+                        else:
+                            cam_z_by_id[img.mapillary_id] = (
+                                elev_m + cam_height_above_ground_m
+                            )
+
+                # Per-image API for new images
+                for img in new_imgs:
+                    thumb_url = ""
+                    thumb_path = None
+                    if download_thumbnails:
+                        thumb_url = _fetch_thumb_url(img.mapillary_id) or ""
+                        if thumb_url:
+                            candidate_path = thumb_dir / f"{img.mapillary_id}.jpg"
+                            if _download_thumbnail(thumb_url, candidate_path):
+                                thumb_path = candidate_path
+                    meta: dict | None = None
+                    if fetch_camera_metadata:
+                        meta = _fetch_camera_metadata(
+                            img.mapillary_id,
+                            metadata_cache_dir,
+                            use_cache=use_cache,
+                        )
+                    final.append(MapillaryImage(
+                        mapillary_id=img.mapillary_id,
+                        position_enu=img.position_enu,
+                        compass_angle_deg=img.compass_angle_deg,
+                        is_pano=img.is_pano,
+                        thumb_url=thumb_url,
+                        thumb_path=thumb_path,
+                        computed_rotation=(
+                            meta["computed_rotation"] if meta else None
+                        ),
+                        focal_ratio=meta["focal_ratio"] if meta else None,
+                        width=meta["width"] if meta else None,
+                        height=meta["height"] if meta else None,
+                        computed_compass_angle=(
+                            meta["computed_compass_angle"] if meta else None
+                        ),
+                        camera_z_m=cam_z_by_id.get(img.mapillary_id),
+                    ))
+                    time.sleep(0.05)
+
+                # Re-filter the now-bigger final list.
+                kept = [
+                    img for img in final
+                    if _matches_aspect(
+                        img.width, img.height,
+                        target_aspect_ratio, aspect_tolerance,
+                    )
+                ]
+                logger.info(
+                    "After escalation: kept %d / %d at aspect %.3f ± %.3f",
+                    len(kept), len(final),
+                    target_aspect_ratio, aspect_tolerance,
+                )
+
+        # Truncate to target_count, preserving FPS order.
+        if len(kept) > target_count:
+            kept = kept[:target_count]
+        final = kept
+
+        if len(final) < target_count:
+            logger.warning(
+                "Aspect filter underfilled even after escalation: "
+                "returning %d / %d. Consider widening tolerance, raising "
+                "radius, or relaxing target_count.",
+                len(final), target_count,
+            )
 
     return final

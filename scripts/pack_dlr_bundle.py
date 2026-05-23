@@ -30,9 +30,13 @@ from atmosphere.scp.bundle import assemble_bundle
 DLR_LAT = 47.6059
 DLR_LON = -122.3392
 RADIUS_M = 150.0
-TARGET_IMAGES = 24                    # WorldMirror VRAM-safe ceiling
+TARGET_IMAGES = 18                    # RTX 4090 24GB VRAM ceiling — 24/20 OOM in GS rendering, 18 should leave ~1 GB buffer
 CAM_HEIGHT_ABOVE_GROUND_M = 1.5
 BUNDLE_DIR = Path("data/bundle_dlr_v0")
+
+# Day 5 RunPod-attempt 2: WorldMirror rejects mixed aspect ratios.
+# Filter to 16:9 (the dominant aspect in modern Mapillary captures).
+TARGET_ASPECT = 16.0 / 9.0
 
 
 def main() -> None:
@@ -46,7 +50,7 @@ def main() -> None:
         print(f"Removing existing {BUNDLE_DIR} ...")
         shutil.rmtree(BUNDLE_DIR)
 
-    print("\n=== 1. Retrieval (Mapillary + DEM + camera metadata) ===")
+    print("\n=== 1. Retrieval (Mapillary + DEM + camera metadata + aspect filter) ===")
     images = fetch_mapillary_images(
         DLR_LAT, DLR_LON,
         radius_m=RADIUS_M,
@@ -55,8 +59,9 @@ def main() -> None:
         fetch_camera_metadata=True,
         fetch_camera_z=True,
         cam_height_above_ground_m=CAM_HEIGHT_ABOVE_GROUND_M,
+        target_aspect_ratio=TARGET_ASPECT,
     )
-    print(f"  -> {len(images)} images retrieved")
+    print(f"  -> {len(images)} images retrieved (all aspect {TARGET_ASPECT:.3f})")
 
     print("\n=== 2. Building footprints (OSM) ===")
     buildings = fetch_buildings(DLR_LAT, DLR_LON, radius_m=RADIUS_M)
