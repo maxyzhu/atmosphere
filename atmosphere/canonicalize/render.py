@@ -2,13 +2,16 @@
 M2 — Render synthetic depth maps from building geometry.
 
 Pipeline: list[Building] → extruded mesh → Open3D RaycastingScene →
-float32 depth map [H, W], meters, np.inf for sky/miss.
+float32 depth map [H, W], meters, SKY_DEPTH_M for sky/miss.
 
 Output format matches WorldMirror 2.0's `prior_depth_path` expectations
 (see hyworld2/worldrecon/hyworldmirror/utils/inference_utils.py:285).
-Sky pixels are kept as np.inf; WorldMirror's _read_depth_file applies
-np.nan_to_num to coerce inf→0 internally, treating those pixels as
-"no prior" rather than "zero depth".
+Sky pixels are written as the SCP-level SKY_DEPTH_M constant
+(currently 1000 m) — a large finite value, far beyond any plausible
+street-level scene scale. WorldMirror's load_prior_depth applies
+`np.nan_to_num(depth, nan=0, posinf=0, neginf=0)` and would silently
+coerce np.inf to 0 (= depth at camera origin), so M2 must emit a
+finite value at the source. See changelog Day 5 Part 1 §1.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from shapely.geometry import Polygon
 
 from atmosphere.canonicalize.camera import Camera
 from atmosphere.retrieval.buildings import Building
+from atmosphere.scp import SKY_DEPTH_M
 
 
 # Default height for buildings with height_m=None. Phase 0 only — once
@@ -156,11 +160,11 @@ def render_depth(
 
     # Edge case: no buildings → all sky.
     if not buildings:
-        return np.full((H, W), np.inf, dtype=np.float32)
+        return np.full((H, W), SKY_DEPTH_M, dtype=np.float32)
 
     mesh = buildings_to_mesh(buildings)
     if len(mesh.vertices) == 0:
-        return np.full((H, W), np.inf, dtype=np.float32)
+        return np.full((H, W), SKY_DEPTH_M, dtype=np.float32)
 
     # Build the raycasting scene and cast.
     scene = o3d.t.geometry.RaycastingScene()
@@ -190,8 +194,11 @@ def render_depth(
     # norm 1/inv_norm, then the camera-frame Z of r is just inv_norm.
     depth_z = t_hit * inv_norm
 
-    # No-hit pixels: Open3D returns +inf for t_hit, so depth_z = inf
-    # already. Cast to float32 and return.
+    # No-hit pixels: Open3D returns +inf for t_hit. Replace with the
+    # finite SCP sky constant so WorldMirror's nan_to_num doesn't
+    # silently coerce them to 0 (= depth at camera origin).
+    depth_z = np.where(np.isfinite(depth_z), depth_z, SKY_DEPTH_M)
+
     return depth_z.astype(np.float32)
 
 
@@ -225,7 +232,7 @@ def render_depth_batch(
         # All-sky output for each camera.
         written: list[Path] = []
         for cam, stem in zip(cameras, image_stems):
-            depth = np.full((cam.height, cam.width), np.inf, dtype=np.float32)
+            depth = np.full((cam.height, cam.width), SKY_DEPTH_M, dtype=np.float32)
             path = output_dir / f"{stem}.npy"
             np.save(path, depth)
             written.append(path)
@@ -246,7 +253,11 @@ def render_depth_batch(
         x_cam = (uu - cam.cx) / cam.fx
         y_cam = (vv - cam.cy) / cam.fy
         inv_norm = 1.0 / np.sqrt(x_cam**2 + y_cam**2 + 1.0)
-        depth_z = (t_hit * inv_norm).astype(np.float32)
+        depth_z = t_hit * inv_norm
+        depth_z = np.where(
+            np.isfinite(depth_z), depth_z, SKY_DEPTH_M,
+        )
+        depth_z = depth_z.astype(np.float32)
 
         path = output_dir / f"{stem}.npy"
         np.save(path, depth_z)

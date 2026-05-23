@@ -20,6 +20,7 @@ from atmosphere.canonicalize.render import (
     render_depth_batch,
 )
 from atmosphere.retrieval.buildings import Building, HeightSource
+from atmosphere.scp import SKY_DEPTH_M
 
 
 def _square_building(
@@ -103,11 +104,15 @@ class TestBuildingsToMesh:
 
 
 class TestRenderDepthBasic:
-    def test_empty_buildings_returns_all_inf(self):
+    def test_empty_buildings_returns_all_sky(self):
         cam = _north_facing_camera()
         depth = render_depth([], cam)
         assert depth.shape == (cam.height, cam.width)
-        assert np.all(np.isinf(depth))
+        # All pixels are sky — should equal the SCP sky constant, not
+        # np.inf (M2 now writes finite depth so WorldMirror's
+        # nan_to_num won't silently coerce sky to 0).
+        assert np.all(depth == SKY_DEPTH_M)
+        assert np.all(np.isfinite(depth))
 
     def test_output_shape_and_dtype(self):
         cam = _north_facing_camera(width=320, height=240)
@@ -117,13 +122,14 @@ class TestRenderDepthBasic:
         assert depth.dtype == np.float32
 
     def test_building_appears_in_image(self):
-        """A building directly in front should produce some hits."""
+        """A building directly in front should produce some non-sky hits."""
         cam = _north_facing_camera()
         b = _square_building(0, 50, size=20, height=30)
         depth = render_depth([b], cam)
-        finite_pixels = np.isfinite(depth)
-        assert finite_pixels.sum() > 100, (
-            f"Expected building hits, got {finite_pixels.sum()} finite pixels"
+        # Hit pixels are anything closer than SKY_DEPTH_M.
+        hit_pixels = depth < SKY_DEPTH_M
+        assert hit_pixels.sum() > 100, (
+            f"Expected building hits, got {hit_pixels.sum()} non-sky pixels"
         )
 
     def test_no_building_means_sky(self):
@@ -131,7 +137,7 @@ class TestRenderDepthBasic:
         cam = _north_facing_camera()
         b = _square_building(0, -50, size=20, height=30)   # south
         depth = render_depth([b], cam)
-        assert np.all(np.isinf(depth))
+        assert np.all(depth == SKY_DEPTH_M)
 
 
 class TestRenderDepthCorrectness:
@@ -211,7 +217,8 @@ class TestRenderDepthBatch:
         stems = ["only"]
         paths = render_depth_batch([], cams, tmp_path, stems)
         arr = np.load(paths[0])
-        assert np.all(np.isinf(arr))
+        assert np.all(arr == SKY_DEPTH_M)
+        assert np.all(np.isfinite(arr))
 
     def test_length_mismatch_raises(self, tmp_path):
         cams = [_north_facing_camera()]

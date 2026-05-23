@@ -41,3 +41,6 @@ cache/
 outputs/
 !outputs/.gitkeep
 *.log
+external/
+# HY-World 2.0 — Tencent's WorldMirror model, fetched separately, do not commit
+model/

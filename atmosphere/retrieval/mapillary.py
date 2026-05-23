@@ -31,6 +31,7 @@ Design notes:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -58,38 +59,101 @@ class MapillaryImage:
     """
     A single street-level image from Mapillary.
 
+    Fields come from two different APIs and are populated lazily:
+
+    1. Vector tile (cheap, batched, always populated):
+       mapillary_id, position_enu, compass_angle_deg, is_pano
+
+    2. Graph API per-image (one HTTP call per image; populated only
+       when fetch_mapillary_images(...) is invoked with
+       download_thumbnails=True or fetch_camera_metadata=True):
+       thumb_url, thumb_path, computed_rotation, focal_ratio,
+       width, height, computed_compass_angle
+
+    The Graph API fields default to None / empty so the dataclass can
+    represent a partially-fetched image without raising. Downstream M3
+    (mapillary_to_camera) treats missing camera-metadata fields as a
+    fail-fast condition: any image missing the four it needs
+    (computed_rotation, focal_ratio, width, height) is dropped from
+    the bundle handed to WorldMirror.
+
     Attributes:
         mapillary_id: Mapillary's globally unique image ID.
         position_enu: (east, north) in meters, in the caller's local frame.
         compass_angle_deg: Camera heading, degrees clockwise from north
-                           (0 = N, 90 = E). None if missing.
-        is_pano: True if this is a 360° equirectangular panorama,
-                 False if a regular perspective image. Read from the
-                 vector tile's `is_pano` property. Downstream world
-                 model conditioning (WorldMirror i2s mode) prefers
-                 panos, so this is the priority signal for selection.
+                           (0 = N, 90 = E). None if missing. From the
+                           vector tile; may differ slightly from
+                           computed_compass_angle (the Graph API
+                           SfM-corrected version).
+        is_pano: True if this is a 360° equirectangular panorama.
+                 Phase 0 M3 skips panos (returns None camera) because
+                 WorldMirror's i2s perspective path can't ingest them
+                 without unwrapping (a Phase 1 task).
         thumb_url: Mapillary CDN URL (signed, may expire). Empty string
                    when thumbnail fetching was skipped.
-        thumb_path: Local filesystem path to the cached thumbnail, or None
-                    if download was skipped or failed.
-        ground_elevation_m: Terrain elevation at this image's position,
-                            in meters above the local ENU z=0 plane.
-                            None in Phase 0 (DEM is Phase 1); reserved
-                            so adding terrain in Phase 1 doesn't require
-                            an architectural rewrite.
+        thumb_path: Local filesystem path to the cached thumbnail, or
+                    None if download was skipped or failed.
+        computed_rotation: SfM-corrected axis-angle 3-vector (radians),
+                           encoding the world-to-camera rotation in
+                           OpenSfM's topocentric frame (which equals
+                           ENU when GPS is present, per OpenSfM docs).
+                           None until fetch_camera_metadata=True is set.
+                           See INSIGHTS.md for the OpenSfM convention.
+        focal_ratio: Per-image focal length expressed as a ratio of
+                     max(width, height). `fx_pixels = focal_ratio *
+                     max(W, H)` (OpenSfM convention). None until
+                     metadata fetched.
+        width, height: Image native resolution in pixels. Needed for K
+                       matrix construction. None until metadata fetched.
+        computed_compass_angle: SfM-corrected heading, degrees CW from
+                                north. Used by M3 as a sanity-check
+                                against the yaw extracted from
+                                computed_rotation. None until metadata
+                                fetched.
+        camera_z_m: Camera's 3D z coordinate in the local ENU frame,
+                    in meters. Equal to DEM-sampled ground elevation
+                    at this image's position plus a camera-height
+                    prior (default 1.5 m above ground, per the
+                    UrbanVGGT 2026 / single-view metrology literature
+                    convention; see changelog Day 5 Part 1 §3-4 for
+                    the literature review and SCP decomposition).
+                    None until fetch_camera_z=True is set; M3 treats
+                    missing camera_z_m as fail-fast for that image.
     """
 
+    # --- from vector tile ---
     mapillary_id: str
     position_enu: tuple[float, float]
     compass_angle_deg: float | None
     is_pano: bool
+
+    # --- from Graph API: thumbnail (existing) ---
     thumb_url: str
     thumb_path: Path | None
-    ground_elevation_m: float | None = None
+
+    # --- from Graph API: camera intrinsics + extrinsics (Day 5 new) ---
+    computed_rotation: tuple[float, float, float] | None = None
+    focal_ratio: float | None = None
+    width: int | None = None
+    height: int | None = None
+    computed_compass_angle: float | None = None
+
+    # --- from DEM + camera-height prior (Day 5 new) ---
+    camera_z_m: float | None = None
 
     @property
     def has_compass(self) -> bool:
         return self.compass_angle_deg is not None
+
+    @property
+    def has_camera_metadata(self) -> bool:
+        """True if all four camera fields needed by M3 are populated."""
+        return (
+            self.computed_rotation is not None
+            and self.focal_ratio is not None
+            and self.width is not None
+            and self.height is not None
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -340,6 +404,12 @@ def _farthest_point_sample(
 # must match the response key, so both are kept consistent below.
 _FIELDS_THUMB = "thumb_2048_url"
 
+# Per-image camera metadata fetched by M3. Field names match Graph API
+# response keys exactly. See INSIGHTS.md §2 for the empirical schema.
+_FIELDS_METADATA = (
+    "camera_parameters,computed_rotation,width,height,computed_compass_angle"
+)
+
 
 def _fetch_thumb_url(image_id: str, timeout_s: float = 15.0) -> str | None:
     """Fetch the (signed, short-lived) thumbnail URL for one image."""
@@ -353,6 +423,98 @@ def _fetch_thumb_url(image_id: str, timeout_s: float = 15.0) -> str | None:
     except Exception as exc:
         logger.warning("Failed to fetch thumb URL for %s: %s", image_id, exc)
         return None
+
+
+def _parse_metadata_response(payload: dict) -> dict | None:
+    """
+    Validate a Graph API metadata response and extract the four fields
+    M3 needs into a flat dict.
+
+    Returns None if any required field is missing or malformed, so the
+    caller can decide whether to drop the image. Callers should not
+    swallow this signal: an incomplete metadata response means the
+    image can't participate in WorldMirror's all-or-nothing prior.
+    """
+    try:
+        cam_params = payload.get("camera_parameters")
+        rot = payload.get("computed_rotation")
+        width = payload.get("width")
+        height = payload.get("height")
+        compass = payload.get("computed_compass_angle")
+
+        if cam_params is None or len(cam_params) < 1:
+            return None
+        if rot is None or len(rot) != 3:
+            return None
+        if width is None or height is None:
+            return None
+
+        return {
+            "focal_ratio": float(cam_params[0]),
+            "computed_rotation": (
+                float(rot[0]), float(rot[1]), float(rot[2]),
+            ),
+            "width": int(width),
+            "height": int(height),
+            "computed_compass_angle": (
+                float(compass) if compass is not None else None
+            ),
+        }
+    except (TypeError, ValueError, IndexError) as exc:
+        logger.warning("Malformed Graph API metadata payload: %s", exc)
+        return None
+
+
+def _fetch_camera_metadata(
+    image_id: str,
+    cache_dir: Path,
+    use_cache: bool = True,
+    timeout_s: float = 15.0,
+) -> dict | None:
+    """
+    Fetch per-image camera metadata from the Graph API, with on-disk
+    caching by image ID.
+
+    Returns the parsed metadata dict (see _parse_metadata_response) on
+    success, or None on any failure (404, missing fields, network
+    error). The cache stores raw API responses as JSON so we can
+    re-parse without re-hitting the network if the parser changes.
+
+    The cache path is {cache_dir}/{image_id}.json. Unlike the tile
+    cache (per (z,x,y) tuple), this is per image ID and shared across
+    queries: re-running an experiment with the same image set is free.
+    """
+    cache_path = cache_dir / f"{image_id}.json"
+
+    if use_cache and cache_path.exists():
+        try:
+            raw = json.loads(cache_path.read_text())
+            # Treat a cached empty object as a known-bad image.
+            if not raw:
+                return None
+            return _parse_metadata_response(raw)
+        except Exception as exc:
+            logger.warning(
+                "Failed to read cached metadata for %s: %s",
+                image_id, exc,
+            )
+            # Fall through to network fetch.
+
+    url = f"https://graph.mapillary.com/{image_id}"
+    params = {"fields": _FIELDS_METADATA}
+    headers = {"Authorization": f"OAuth {get_mapillary_token()}"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=timeout_s)
+        r.raise_for_status()
+        raw = r.json()
+    except Exception as exc:
+        logger.warning("Failed to fetch metadata for %s: %s", image_id, exc)
+        return None
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(raw))
+
+    return _parse_metadata_response(raw)
 
 
 def _download_thumbnail(
@@ -392,6 +554,9 @@ def fetch_mapillary_images(
     frame: LocalFrame | None = None,
     target_count: int | None = None,
     download_thumbnails: bool = True,
+    fetch_camera_metadata: bool = False,
+    fetch_camera_z: bool = False,
+    cam_height_above_ground_m: float = 1.5,
     cache_dir: Path | str = "data/mapillary_cache",
     use_cache: bool = True,
 ) -> list[MapillaryImage]:
@@ -412,8 +577,25 @@ def fetch_mapillary_images(
             If None, computed from area density (20 imgs / 10 000 m²).
             If the candidate pool is smaller than target, all are kept.
         download_thumbnails: If True, call Graph API for signed thumb
-            URLs and download each to disk. If False, no Graph API is
-            touched and thumb_url / thumb_path stay empty / None.
+            URLs and download each to disk. If False, no thumb URLs
+            are fetched and thumb_url / thumb_path stay empty / None.
+        fetch_camera_metadata: If True, call Graph API per sampled image
+            for camera intrinsics + extrinsics (computed_rotation,
+            focal_ratio, width, height, computed_compass_angle) and
+            populate those fields on the returned MapillaryImage.
+            Required by M3 (mapillary_to_camera); not needed for pure
+            visualization or sampling experiments. Cached per image ID
+            so repeated runs are free.
+        fetch_camera_z: If True, sample DEM elevation at each sampled
+            image's position and populate camera_z_m = DEM elevation +
+            cam_height_above_ground_m. Required by M3. Cached per DEM
+            tile so repeated runs are nearly free after the first
+            download.
+        cam_height_above_ground_m: Prior on camera height above local
+            ground level, in meters. Default 1.5 (handheld/dashcam),
+            applied uniformly to all sampled images. Phase 1+ may
+            condition this on camera_type or estimate per-image via
+            Perspective Fields (changelog Day 5 Part 1 §3).
         cache_dir: Root directory for tile cache and (if downloading)
             thumbnail cache.
         use_cache: If False, ignore the on-disk tile cache.
@@ -428,7 +610,10 @@ def fetch_mapillary_images(
     cache_dir = Path(cache_dir)
     tile_cache_dir = cache_dir / "tiles"
     thumb_dir = cache_dir / "thumbnails"
+    metadata_cache_dir = cache_dir / "metadata"
     tile_cache_dir.mkdir(parents=True, exist_ok=True)
+    if fetch_camera_metadata:
+        metadata_cache_dir.mkdir(parents=True, exist_ok=True)
 
     if target_count is None:
         target_count = _density_target(radius_m)
@@ -496,18 +681,65 @@ def fetch_mapillary_images(
         len(sampled), target_count, len(parsed),
     )
 
-    if not download_thumbnails:
+    if (
+        not download_thumbnails
+        and not fetch_camera_metadata
+        and not fetch_camera_z
+    ):
         return sampled
 
-    # --- 5. Per-image Graph API for thumb URL, then download ---
+    # --- 5a. Batch DEM elevation sampling for sampled images ---
+    # We do this once for the whole batch (one TIFF open) rather than
+    # per-image, since all 24 sampled images typically land in the
+    # same sub-TIFF. WGS84 round-trip via the local ENU frame.
+    cam_z_by_id: dict[str, float | None] = {}
+    if fetch_camera_z:
+        # Lazy import so this module stays importable without DEM deps.
+        from atmosphere.retrieval.dem import sample_elevations_batch
+
+        latlon_pairs: list[tuple[float, float]] = []
+        for img in sampled:
+            e, n = img.position_enu
+            img_lat, img_lon, _ = frame.enu_to_wgs84(e, n, 0.0)
+            latlon_pairs.append((float(img_lat), float(img_lon)))
+
+        dem_results = sample_elevations_batch(latlon_pairs)
+        for img, (elev_m, _src) in zip(sampled, dem_results, strict=True):
+            if elev_m is None:
+                cam_z_by_id[img.mapillary_id] = None
+            else:
+                cam_z_by_id[img.mapillary_id] = (
+                    elev_m + cam_height_above_ground_m
+                )
+
+        n_with_z = sum(1 for v in cam_z_by_id.values() if v is not None)
+        logger.info(
+            "DEM: %d / %d images have camera_z_m populated",
+            n_with_z, len(sampled),
+        )
+
+    # --- 5b. Per-image Graph API: thumb URL + camera metadata as requested ---
     final: list[MapillaryImage] = []
     for img in sampled:
-        thumb_url = _fetch_thumb_url(img.mapillary_id) or ""
+        # Thumbnail (existing path).
+        thumb_url = ""
         thumb_path: Path | None = None
-        if thumb_url:
-            candidate_path = thumb_dir / f"{img.mapillary_id}.jpg"
-            if _download_thumbnail(thumb_url, candidate_path):
-                thumb_path = candidate_path
+        if download_thumbnails:
+            thumb_url = _fetch_thumb_url(img.mapillary_id) or ""
+            if thumb_url:
+                candidate_path = thumb_dir / f"{img.mapillary_id}.jpg"
+                if _download_thumbnail(thumb_url, candidate_path):
+                    thumb_path = candidate_path
+
+        # Camera metadata (Day 5 new path).
+        meta: dict | None = None
+        if fetch_camera_metadata:
+            meta = _fetch_camera_metadata(
+                img.mapillary_id,
+                metadata_cache_dir,
+                use_cache=use_cache,
+            )
+
         final.append(MapillaryImage(
             mapillary_id=img.mapillary_id,
             position_enu=img.position_enu,
@@ -515,8 +747,24 @@ def fetch_mapillary_images(
             is_pano=img.is_pano,
             thumb_url=thumb_url,
             thumb_path=thumb_path,
-            ground_elevation_m=img.ground_elevation_m,
+            computed_rotation=(
+                meta["computed_rotation"] if meta else None
+            ),
+            focal_ratio=meta["focal_ratio"] if meta else None,
+            width=meta["width"] if meta else None,
+            height=meta["height"] if meta else None,
+            computed_compass_angle=(
+                meta["computed_compass_angle"] if meta else None
+            ),
+            camera_z_m=cam_z_by_id.get(img.mapillary_id),
         ))
         time.sleep(0.05)  # politeness between Graph API hits
+
+    if fetch_camera_metadata:
+        with_meta = sum(1 for f in final if f.has_camera_metadata)
+        logger.info(
+            "Camera metadata: %d / %d images have all four required fields",
+            with_meta, len(final),
+        )
 
     return final

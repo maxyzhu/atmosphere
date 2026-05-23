@@ -308,3 +308,12 @@ model output to absolute, independently-sourced LoD geometry, which SfM
 alone cannot do (locally consistent, globally arbitrary). M3 reduces to
 a thin adapter (read API → rotvec → JSON, ≤ 100 LOC). SFB's A/B becomes:
 Mapillary-only baseline vs Mapillary + OSM LoD anchor.
+
+**Future**
+作为分析platform的价值
+如果你的reality-anchored generation能provideGoogle Street View没有的视角——比如某个时间段的、某个assumed condition下的、某个hypothetical change后的世界——它就不再和Google Street View竞争,而是enable了原本不可能的分析。具体说,在你生成的"可信Seattle"里,可以做:
+What-if分析:如果这条街改成步行街,周围会是什么样?如果这个路口加一栋50层楼,阴影怎么落?如果这条道路加宽,行人视线会怎么变?
+量化测量:这个路口的sky exposure是多少?这条街的enclosure ratio是多少?这个广场的visual permeability如何?
+simulation:在这个虚拟空间里跑pedestrian agent、autonomous vehicle、emergency response——测试设计在动态使用下的表现
+预测:基于这个空间,某种设计干预的visual impact是什么?某条新街道的wayfinding效果如何?
+这些分析的前提是世界model足够可信——可信到分析结果有意义。如果world model不准,分析就是garbage in garbage out。所以你的直觉本质是:reality-anchored generation的真正终极价值不在"看",而在"算"。
